@@ -1,4 +1,4 @@
-# semantic-cache — Phase 1: Embedding + Similarity Core
+# semantic-cache
 
 A semantic caching layer for LLM APIs. Instead of caching on exact prompt text, this
 caches on *meaning* — if a new prompt is close enough in embedding space to a
@@ -14,11 +14,16 @@ Later phases would wrap this core in a proxy that intercepts real API calls.
 ```
 semantic-cache/
 ├── app/
+│   ├── main.py                 # FastAPI proxy: POST /v1/chat/completions
 │   ├── embeddings/
 │   │   └── local_embedder.py   # text -> vector, and vector-vector cosine similarity
-│   └── cache/
-│       ├── key_builder.py      # hashes (system_prompt, model, temperature) into a config partition key
-│       └── vector_store.py     # RedisVL schema, storage, config-aware nearest-neighbor query
+│   ├── cache/
+│   │   ├── key_builder.py      # hashes (system_prompt, model, temperature) into a config partition key
+│   │   └── vector_store.py     # RedisVL schema, storage, config-aware nearest-neighbor query
+│   └── providers/
+│       ├── groq_client.py      # complete(messages, model, temperature) -> str, via Groq's API
+│       ├── ollama_client.py    # same interface, via a local Ollama server
+│       └── router.py           # picks a provider by model name
 ├── tests/
 │   ├── test_local_embedder.py  # CLI demo tying the embedder + cache store together
 │   └── test_key_builder.py     # standalone checks for config-partitioned cache hits/misses
@@ -240,9 +245,117 @@ longer sibling's.
 
 ## What's out of scope for Phase 2
 
-Still no HTTP proxy or interception of real LLM API calls, no cache eviction/TTL
+No HTTP proxy or interception of real LLM API calls yet, no cache eviction/TTL
 policy, and no attempt at query-time optimization for large numbers of distinct
 configs (a production system with thousands of configs would likely want a smarter
 approach than "always fetch top-5 across every config and filter in Python" — but at
 demo scale, that cost is negligible, and it's what makes the HIT/MISS_NO_MATCH/
 MISS_CONFIG_MISMATCH distinction possible at all). Those remain Phase 3+ concerns.
+
+## Phase 3: FastAPI proxy + provider routing
+
+Phases 1-2 proved the cache logic works in isolation, but nothing actually intercepted
+a real LLM call yet. Phase 3 wraps `SemanticCacheStore` and `LocalEmbedder` in an HTTP
+proxy that mirrors the OpenAI chat completions API shape: `POST /v1/chat/completions`
+with `{"model", "messages", "temperature"}` in, an OpenAI-shaped response out, plus an
+extra `cache_status` field showing `HIT`, `MISS_NO_MATCH`, or `MISS_CONFIG_MISMATCH` so
+the caching behavior is visible during testing rather than hidden.
+
+**Why the embedder and cache store are loaded once at module scope, not per-request.**
+`app/main.py` creates `embedder = LocalEmbedder()` and `cache = SemanticCacheStore(...)`
+at import time, not inside the request handler. Loading `all-MiniLM-L6-v2` takes real
+time; doing that once at process startup instead of on every request is the difference
+between a proxy that adds milliseconds of overhead and one that adds seconds.
+
+**Why `ensure_index()` exists as a separate method from `reset()`.** The demo/test
+scripts want a clean slate every run (`reset()`, which drops and recreates). A proxy is
+the opposite: it's meant to keep serving cache hits across its whole lifetime, so
+restarting it should NOT wipe previously cached responses. `ensure_index()` creates the
+index only if it's missing (`overwrite=False`) and otherwise leaves both the index and
+its data untouched — this is the "long-lived proxy" behavior the Phase 1/2 READMEs
+already said would eventually be needed.
+
+**Why `classify_results()` now returns `(CacheStatus, matched_entry | None)` instead of
+just `CacheStatus`.** Phase 2 only ever needed to know *whether* a hit occurred. The
+proxy needs the actual cached `response` text to return to the caller on a `HIT` — the
+status alone doesn't carry that. Rather than have `main.py` re-scan the results itself
+(duplicating the exact same scan-in-similarity-order logic that already lives in
+`classify_results`), the function now hands back the winning entry directly. `tests/`
+were updated for the new return shape, including new assertions that a `HIT` carries a
+non-`None` matched entry and a `MISS` carries `None`.
+
+**Why the cache only ever sees the last user message + system prompt, but the provider
+gets the full conversation.** `SemanticCacheStore` embeds and matches on a single piece
+of text — there's no notion of multi-turn history in its interface. Rather than build
+that in now, the proxy embeds only the latest user message (a single-turn
+approximation of "what is this request asking"), while `provider_complete()` still
+receives every message in the request, so the actual LLM call keeps full context. The
+tradeoff: a cache hit is judged only on the latest turn, so two different conversations
+that happen to end in the same question could hit each other's cached answer even if
+earlier turns differed. Acceptable for proving the pipeline end-to-end; a real system
+would likely hash/embed more of the conversation.
+
+**Why provider routing is "one function per provider, same signature," picked by a
+lookup in `router.py` — not, say, a base class with subclasses.** `groq_client.complete()`
+and `ollama_client.complete()` both have the exact same shape:
+`(messages: list[dict], model: str, temperature: float) -> str`. `main.py` never needs
+to know which one it's calling — it just calls `provider_complete(...)` and gets a
+string back. A plain function with a shared signature is enough to make that swap
+invisible to the caller; a class hierarchy would add structure (an abstract base,
+instantiation, `self`) without buying anything a bare function doesn't already give
+here. `router.py` itself is a single `if model in OLLAMA_MODELS: ... else: ...` —
+routing by exact model name, since that's the one piece of information the request
+already carries that unambiguously identifies which backend should serve it.
+
+**`router.OLLAMA_MODELS`.** Now that Ollama is set up locally with `llama3.2:1b`
+pulled, `OLLAMA_MODELS = {"llama3.2:1b"}` — a request with `"model": "llama3.2:1b"`
+routes to Ollama, anything else still routes to Groq. Confirms the design held up
+exactly as intended: adding Ollama support was a one-line change to this set, nothing
+else in `main.py` or either provider client needed to change. (Originally set up with
+`phi3:mini`, swapped to the smaller `llama3.2:1b` after `phi3:mini`'s ~1.9 GB compute
+buffer failed to allocate under low free RAM — see the note on model size tradeoffs
+in the setup steps below.)
+
+**Why the Groq client lazily initializes its client object instead of doing it at
+import time.** `main.py` imports `router`, which imports `groq_client` — if that import
+eagerly constructed a `Groq(api_key=...)` client, simply importing `app.main` would
+crash whenever `GROQ_API_KEY` isn't set, even for a request that's served entirely from
+cache or would have routed to Ollama. Constructing the client lazily, on first actual
+use, means the API key is only required when a request genuinely needs to reach Groq.
+
+**Why `GROQ_API_KEY` is read from the environment, never hardcoded or passed in a
+request.** It's a secret tied to your account and billing — putting it in code (or
+committing it) risks leaking it into git history or logs. Reading it from the
+environment keeps it out of the codebase entirely; you set it once per shell session
+before starting the server.
+
+## Running the proxy
+
+```bash
+uvicorn app.main:app --reload --port 8000
+```
+
+Requires `GROQ_API_KEY` set in the environment first (`export GROQ_API_KEY=...` /
+`$env:GROQ_API_KEY = "..."` on PowerShell) and Redis Stack running, same as the earlier
+phases.
+
+## Testing the proxy
+
+Three requests that exercise the three `cache_status` outcomes:
+
+1. A prompt with nothing cached yet -> a MISS, routed to Groq.
+2. A near-duplicate of it, same config -> `HIT`, served from Redis, no Groq call.
+3. A request with `"model": "llama3.2:1b"` -> routed to the local Ollama server
+   instead of Groq, per `router.OLLAMA_MODELS`.
+
+See exact commands below.
+
+## What's out of scope for Phase 3
+
+No streaming (the whole response is generated before anything is returned to the
+client — that's Phase 7 per the roadmap). Minimal error handling: a malformed request
+gets a basic 400, but a Groq/Ollama call failing outright isn't retried or gracefully
+degraded — this phase proves the pipeline works end-to-end, not production robustness.
+No cache eviction/TTL still. Multi-turn conversations
+are cached on a single-turn approximation (see the design-choices note above) rather
+than considering the full message history.

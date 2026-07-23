@@ -28,10 +28,10 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from redis.exceptions import ConnectionError as RedisConnectionError
 
 from app.cache.key_builder import build_cache_key
-from app.cache.vector_store import SemanticCacheStore, classify_results
+from app.cache.vector_store import DEFAULT_SIMILARITY_THRESHOLD, SemanticCacheStore, classify_results
 from app.embeddings.local_embedder import LocalEmbedder
 
-CACHE_HIT_THRESHOLD = 0.95
+CACHE_HIT_THRESHOLD = DEFAULT_SIMILARITY_THRESHOLD
 DUMMY_RESPONSE = "[dummy cached response for prompt 1]"
 
 
@@ -105,7 +105,7 @@ def main() -> int:
             f"prompt={r['prompt']!r} response={r['response']!r}"
         )
 
-    status = classify_results(results, CACHE_HIT_THRESHOLD)
+    status, _ = classify_results(results, CACHE_HIT_THRESHOLD)
     print(f"\nthreshold: {CACHE_HIT_THRESHOLD}")
     print(f"RESULT: {status.value}")
 

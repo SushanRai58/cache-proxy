@@ -20,11 +20,16 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from redis.exceptions import ConnectionError as RedisConnectionError
 
 from app.cache.key_builder import build_cache_key
-from app.cache.vector_store import CacheStatus, SemanticCacheStore, classify_results
+from app.cache.vector_store import (
+    DEFAULT_SIMILARITY_THRESHOLD,
+    CacheStatus,
+    SemanticCacheStore,
+    classify_results,
+)
 from app.embeddings.local_embedder import LocalEmbedder
 
 TEST_INDEX_NAME = "semantic_cache_test"
-THRESHOLD = 0.95
+THRESHOLD = DEFAULT_SIMILARITY_THRESHOLD
 
 
 def check(label: str, condition: bool) -> None:
@@ -47,28 +52,31 @@ def test_config_aware_classification(embedder: LocalEmbedder) -> None:
     store.reset()
 
     base_prompt = "How do I reverse a linked list in Python?"
+    base_response = "[dummy response]"
     base_config = {"system_prompt": "You are a coding assistant.", "model": "gpt-4", "temperature": 0.7}
-    store.store(base_prompt, "[dummy response]", embedder.embed(base_prompt), **base_config)
+    store.store(base_prompt, base_response, embedder.embed(base_prompt), **base_config)
 
     query_vector = embedder.embed(base_prompt)
 
-    status = classify_results(store.query(query_vector, top_k=5, **base_config), THRESHOLD)
+    status, matched = classify_results(store.query(query_vector, top_k=5, **base_config), THRESHOLD)
     check("same prompt, same config -> HIT", status is CacheStatus.HIT)
+    check("HIT returns the matched entry's response", matched is not None and matched["response"] == base_response)
 
     cfg = {**base_config, "temperature": 0.2}
-    status = classify_results(store.query(query_vector, top_k=5, **cfg), THRESHOLD)
+    status, matched = classify_results(store.query(query_vector, top_k=5, **cfg), THRESHOLD)
     check("different temperature -> MISS_CONFIG_MISMATCH", status is CacheStatus.MISS_CONFIG_MISMATCH)
+    check("MISS returns no matched entry", matched is None)
 
     cfg = {**base_config, "system_prompt": "You are a poet."}
-    status = classify_results(store.query(query_vector, top_k=5, **cfg), THRESHOLD)
+    status, matched = classify_results(store.query(query_vector, top_k=5, **cfg), THRESHOLD)
     check("different system_prompt -> MISS_CONFIG_MISMATCH", status is CacheStatus.MISS_CONFIG_MISMATCH)
 
     cfg = {**base_config, "model": "gpt-3.5-turbo"}
-    status = classify_results(store.query(query_vector, top_k=5, **cfg), THRESHOLD)
+    status, matched = classify_results(store.query(query_vector, top_k=5, **cfg), THRESHOLD)
     check("different model -> MISS_CONFIG_MISMATCH", status is CacheStatus.MISS_CONFIG_MISMATCH)
 
     unrelated_vector = embedder.embed("What's a good sourdough starter recipe?")
-    status = classify_results(store.query(unrelated_vector, top_k=5, **base_config), THRESHOLD)
+    status, matched = classify_results(store.query(unrelated_vector, top_k=5, **base_config), THRESHOLD)
     check("unrelated prompt, same config -> MISS_NO_MATCH", status is CacheStatus.MISS_NO_MATCH)
 
 
@@ -104,17 +112,19 @@ def test_top_k_prevents_false_mismatch(embedder: LocalEmbedder) -> None:
     )
     check("both entries clear the threshold", all(r["similarity"] >= THRESHOLD for r in results[:2]))
 
-    status = classify_results(results, THRESHOLD)
+    status, matched = classify_results(results, THRESHOLD)
     check("classifier scans past rank 1 and finds the same-config match -> HIT", status is CacheStatus.HIT)
+    check("matched entry is the same-config (rank 2) one, not rank 1", matched is not None and matched["config_match"] is True)
 
     # Prove this is actually testing what it claims to: feeding the
     # classifier only the rank-1 result (i.e. simulating the old top_k=1
     # behavior) should reproduce the exact bug this test guards against.
-    naive_status = classify_results(results[:1], THRESHOLD)
+    naive_status, naive_matched = classify_results(results[:1], THRESHOLD)
     check(
         "regression check: top_k=1 would have misreported MISS_CONFIG_MISMATCH here",
         naive_status is CacheStatus.MISS_CONFIG_MISMATCH,
     )
+    check("...and would have had no matched entry to fall back on", naive_matched is None)
 
 
 def main() -> int:

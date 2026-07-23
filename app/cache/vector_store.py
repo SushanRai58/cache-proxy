@@ -17,6 +17,11 @@ INDEX_NAME = "semantic_cache"
 VECTOR_FIELD = "vector"
 CONFIG_HASH_FIELD = "config_hash"
 DEFAULT_TOP_K = 5
+# Single source of truth for the cache-hit similarity bar. Three call sites
+# now compare against this (the CLI demo, the test suite, and the proxy) --
+# defining it once means changing the threshold is a one-line edit, not a
+# hunt across files that all happened to hardcode 0.95.
+DEFAULT_SIMILARITY_THRESHOLD = 0.95
 
 
 class CacheStatus(Enum):
@@ -85,6 +90,14 @@ class SemanticCacheStore:
         # keep appending/querying across its process lifetime.
         self.index.create(overwrite=True, drop=True)
 
+    def ensure_index(self) -> None:
+        # Idempotent: creates the index if it doesn't exist yet, and leaves
+        # both the index and any already-cached data alone if it does.
+        # reset() is for demo/test scripts that want a clean slate every
+        # run; a long-lived proxy calls this instead at startup, since
+        # restarting the server should NOT wipe previously cached responses.
+        self.index.create(overwrite=False)
+
     def store(
         self,
         prompt: str,
@@ -146,8 +159,12 @@ class SemanticCacheStore:
         return annotated
 
 
-def classify_results(results: list[dict], threshold: float) -> CacheStatus:
-    """Turn query()'s annotated results into a HIT / MISS_* verdict.
+def classify_results(results: list[dict], threshold: float) -> tuple[CacheStatus, dict | None]:
+    """Turn query()'s annotated results into a (status, matched_entry) pair.
+
+    matched_entry is the winning result dict on HIT (so a caller can read
+    its "response" straight off it -- this is what main.py returns to the
+    client), and None on either MISS variant.
 
     Redis's KNN search already returns nearest-first, so scanning the list
     in order is scanning in similarity order -- no re-sort needed. Scanning
@@ -160,5 +177,6 @@ def classify_results(results: list[dict], threshold: float) -> CacheStatus:
         if result["similarity"] >= threshold:
             any_similar_entry = True
             if result["config_match"]:
-                return CacheStatus.HIT
-    return CacheStatus.MISS_CONFIG_MISMATCH if any_similar_entry else CacheStatus.MISS_NO_MATCH
+                return CacheStatus.HIT, result
+    status = CacheStatus.MISS_CONFIG_MISMATCH if any_similar_entry else CacheStatus.MISS_NO_MATCH
+    return status, None
